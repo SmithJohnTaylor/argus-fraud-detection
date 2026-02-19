@@ -18,6 +18,8 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from enum import Enum
 
+import random
+
 import aiohttp
 from confluent_kafka import Consumer, Producer, KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
@@ -37,6 +39,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Risk threshold constants
+CRITICAL_RISK_THRESHOLD = 0.80
+HIGH_RISK_THRESHOLD = 0.60
+MEDIUM_RISK_THRESHOLD = 0.40
 
 # Create specialized loggers
 tool_logger = logging.getLogger('tools')
@@ -88,9 +95,6 @@ class TransactionHistoryTool:
         tool_logger.info(f"Checking transaction history for customer {customer_id} (last {days} days)")
         
         try:
-            # Simulate database lookup delay
-            await asyncio.sleep(0.1)
-            
             # Generate realistic historical data
             profile = self._get_or_create_customer_profile(customer_id)
             history = self._generate_transaction_history(customer_id, days, profile)
@@ -125,8 +129,6 @@ class TransactionHistoryTool:
         """Get or create customer profile"""
         if customer_id not in self.customer_profiles:
             # Generate realistic customer profile
-            import random
-            
             account_age = random.randint(30, 2000)  # days
             risk_scores = [round(random.uniform(0.1, 0.4), 3) for _ in range(10)]
             
@@ -146,8 +148,6 @@ class TransactionHistoryTool:
     
     def _generate_transaction_history(self, customer_id: str, days: int, profile: Dict[str, Any]) -> Dict[str, Any]:
         """Generate realistic transaction history"""
-        import random
-        
         # Base transaction patterns
         daily_avg_transactions = random.uniform(1.5, 5.0)
         total_transactions = int(days * daily_avg_transactions)
@@ -194,9 +194,6 @@ class RiskCalculatorTool:
         tool_logger.info(f"Calculating risk score for transaction {transaction.get('transaction_id')}")
         
         try:
-            # Simulate ML model processing delay
-            await asyncio.sleep(0.2)
-            
             risk_factors = {}
             
             # Amount risk
@@ -238,11 +235,11 @@ class RiskCalculatorTool:
             )
             
             # Determine risk level
-            if composite_score >= 0.80:
+            if composite_score >= CRITICAL_RISK_THRESHOLD:
                 risk_level = RiskLevel.CRITICAL.value
-            elif composite_score >= 0.60:
+            elif composite_score >= HIGH_RISK_THRESHOLD:
                 risk_level = RiskLevel.HIGH.value
-            elif composite_score >= 0.40:
+            elif composite_score >= MEDIUM_RISK_THRESHOLD:
                 risk_level = RiskLevel.MEDIUM.value
             else:
                 risk_level = RiskLevel.LOW.value
@@ -334,7 +331,7 @@ class RiskCalculatorTool:
                 return 0.1
             else:
                 return 0.2
-        except:
+        except Exception:
             return 0.3
     
     def _calculate_behavior_risk(self, history: Optional[Dict[str, Any]]) -> float:
@@ -433,9 +430,6 @@ class ComplianceTool:
         tool_logger.info(f"Checking compliance rules for transaction {transaction.get('transaction_id')}")
         
         try:
-            # Simulate compliance check delay
-            await asyncio.sleep(0.1)
-            
             violations = []
             warnings = []
             
@@ -496,12 +490,15 @@ class ComplianceTool:
         if amount >= 10000 and transaction.get('payment_method') == 'CASH':
             violations.append("CTR_REQUIRED: Cash transaction >= $10,000")
         
-        # Structuring detection
-        if history and amount > 9000 and amount < 10000:
-            daily_total = sum(float(tx.get('amount', 0)) 
-                            for tx in history.get('recent_transactions', [])
-                            if tx.get('date') == transaction.get('timestamp')[:10])
-            if daily_total >= 10000:
+        # Structuring detection — use aggregate history data since individual
+        # transactions are not available in the history result
+        if history and 9000 < amount < 10000:
+            total_amount = history.get('total_amount', 0)
+            frequency = history.get('transaction_frequency', 0)
+            days_analyzed = history.get('days_analyzed', 30)
+            # Estimate recent daily spend from historical averages
+            estimated_daily_amount = total_amount / max(days_analyzed, 1)
+            if estimated_daily_amount + amount >= 10000 and frequency >= 3:
                 violations.append("STRUCTURING_SUSPECTED: Multiple transactions totaling >= $10,000")
         
         # High-risk countries
@@ -628,10 +625,17 @@ class AlertTool:
     """Tool for creating and managing alerts"""
     
     def __init__(self):
-        self.alert_queue = asyncio.Queue()
+        self._alert_queue = None
         # Import and initialize NotificationTools for Kafka publishing
         from tools.notification import NotificationTools
         self.notification_tools = NotificationTools()
+
+    @property
+    def alert_queue(self):
+        """Lazily create the asyncio.Queue inside the running event loop."""
+        if self._alert_queue is None:
+            self._alert_queue = asyncio.Queue()
+        return self._alert_queue
     
     async def create_alert(self, transaction: Dict[str, Any], alert_type: str, 
                           severity: str, message: str, 
@@ -670,9 +674,6 @@ class AlertTool:
                 tool_logger.info(f"Alert {alert_id} published to Kafka")
             except Exception as e:
                 tool_logger.error(f"Failed to publish alert {alert_id} to Kafka: {e}")
-            
-            # Simulate alert delivery delay
-            await asyncio.sleep(0.05)
             
             result = {
                 "alert_id": alert_id,
@@ -875,6 +876,12 @@ DECISION CRITERIA:
 - MANUAL_REVIEW: Medium-high risk, unusual patterns requiring human review
 - ADDITIONAL_AUTH: Medium risk, could be legitimate but needs verification
 
+IMPORTANT: After your analysis, you MUST include exactly one of the following decision tokens on its own line in your final response:
+DECISION: APPROVE
+DECISION: DECLINE
+DECISION: MANUAL_REVIEW
+DECISION: ADDITIONAL_AUTH
+
 Be thorough but efficient. Use your tools strategically and provide clear reasoning for your decision."""
 
             user_message = f"""Analyze this financial transaction:
@@ -889,67 +896,126 @@ Please use your available tools to conduct a thorough analysis and provide a dec
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json"
             }
-            
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                "tools": self._format_tools_for_api(),
-                "tool_choice": "auto",
-                "max_tokens": 4000,
-                "temperature": 0.1
-            }
-            
-            api_logger.debug(f"Making API call for transaction {transaction_id}")
-            
-            async with self.session.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                
-                if response.status != 200:
-                    error_text = await response.text()
-                    api_logger.error(f"API error {response.status}: {error_text}")
-                    raise Exception(f"API error {response.status}: {error_text}")
-                
-                result = await response.json()
-                
-                # Process the response and handle tool calls
-                decision_data = await self._process_ai_response(
-                    result, transaction, tool_calls_made, tool_results, reasoning_steps
-                )
-                
-                processing_time = int((time.time() - start_time) * 1000)
-                
-                # Create final decision object
-                decision = AIDecision(
-                    decision_id=f"DEC_{uuid.uuid4().hex[:8].upper()}",
-                    transaction_id=transaction_id,
-                    customer_id=transaction.get('customer_id', ''),
-                    decision_type=decision_data['decision_type'],
-                    risk_level=decision_data['risk_level'],
-                    confidence_score=decision_data['confidence_score'],
-                    reasoning=decision_data['reasoning'],
-                    tool_calls_made=tool_calls_made,
-                    tool_results=tool_results,
-                    processing_time_ms=processing_time,
-                    model_used=self.model,
-                    timestamp=datetime.now().isoformat(),
-                    metadata={
-                        "reasoning_steps": reasoning_steps,
-                        "api_response_id": result.get('id', ''),
-                        "total_tokens": result.get('usage', {}).get('total_tokens', 0)
-                    }
-                )
-                
-                api_logger.info(f"AI analysis complete for {transaction_id}: "
-                              f"{decision_data['decision_type']} ({processing_time}ms)")
-                
-                return asdict(decision)
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
+
+            # Multi-turn tool-call loop: call API → execute tools → send results back → repeat
+            max_iterations = 5
+            last_response_id = ''
+            total_tokens = 0
+
+            for iteration in range(max_iterations):
+                payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": self._format_tools_for_api(),
+                    "tool_choice": "auto",
+                    "max_tokens": 4000,
+                    "temperature": 0.1
+                }
+
+                api_logger.debug(f"Making API call for transaction {transaction_id} (iteration {iteration + 1})")
+
+                async with self.session.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as response:
+
+                    if response.status != 200:
+                        error_text = await response.text()
+                        api_logger.error(f"API error {response.status}: {error_text}")
+                        raise Exception(f"API error {response.status}: {error_text}")
+
+                    result = await response.json()
+                    last_response_id = result.get('id', '')
+                    total_tokens += result.get('usage', {}).get('total_tokens', 0)
+
+                message = result['choices'][0]['message']
+                pending_tool_calls = message.get('tool_calls')
+
+                if not pending_tool_calls:
+                    # No more tool calls — model returned a final text response
+                    break
+
+                # Append the assistant message (with tool_calls) to conversation
+                messages.append(message)
+
+                reasoning_logger.info(f"AI requested {len(pending_tool_calls)} tool calls (iteration {iteration + 1})")
+
+                # Execute each tool call and append results as tool messages
+                for tool_call in pending_tool_calls:
+                    function_name = tool_call['function']['name']
+                    arguments = json.loads(tool_call['function']['arguments'])
+                    tool_call_id = tool_call.get('id', '')
+
+                    reasoning_logger.info(f"Executing tool: {function_name} with args: {arguments}")
+                    tool_calls_made.append(function_name)
+
+                    if function_name in self.available_functions:
+                        try:
+                            func = self.available_functions[function_name]['function']
+                            tool_result = await func(**arguments)
+                            tool_results[function_name] = tool_result
+                            reasoning_steps.append(f"Executed {function_name}: {tool_result}")
+                        except Exception as e:
+                            error_msg = f"Tool execution error for {function_name}: {str(e)}"
+                            reasoning_logger.error(error_msg)
+                            tool_result = {"error": str(e)}
+                            tool_results[function_name] = tool_result
+                            reasoning_steps.append(error_msg)
+                    else:
+                        tool_result = {"error": f"Unknown function: {function_name}"}
+                        tool_results[function_name] = tool_result
+
+                    # Append the tool result message for the model
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": json.dumps(tool_result, default=str)
+                    })
+
+            # Extract decision from the final AI response
+            ai_reasoning = message.get('content', '') or ''
+            reasoning_steps.append(f"AI Reasoning: {ai_reasoning}")
+
+            decision_type = self._extract_decision_type(ai_reasoning, tool_results)
+            risk_level = self._extract_risk_level(tool_results)
+            confidence_score = self._extract_confidence_score(tool_results)
+
+            reasoning_logger.info(f"Final decision: {decision_type} (risk: {risk_level}, confidence: {confidence_score})")
+
+            processing_time = int((time.time() - start_time) * 1000)
+
+            # Create final decision object
+            decision = AIDecision(
+                decision_id=f"DEC_{uuid.uuid4().hex[:8].upper()}",
+                transaction_id=transaction_id,
+                customer_id=transaction.get('customer_id', ''),
+                decision_type=decision_type,
+                risk_level=risk_level,
+                confidence_score=confidence_score,
+                reasoning=ai_reasoning,
+                tool_calls_made=tool_calls_made,
+                tool_results=tool_results,
+                processing_time_ms=processing_time,
+                model_used=self.model,
+                timestamp=datetime.now().isoformat(),
+                metadata={
+                    "reasoning_steps": reasoning_steps,
+                    "api_response_id": last_response_id,
+                    "total_tokens": total_tokens
+                }
+            )
+
+            api_logger.info(f"AI analysis complete for {transaction_id}: "
+                          f"{decision_type} ({processing_time}ms)")
+
+            return asdict(decision)
                 
         except Exception as e:
             api_logger.error(f"Error in AI analysis for {transaction_id}: {e}")
@@ -972,89 +1038,35 @@ Please use your available tools to conduct a thorough analysis and provide a dec
                 metadata={"error": True}
             ))
     
-    async def _process_ai_response(self, api_response: Dict[str, Any], transaction: Dict[str, Any],
-                                 tool_calls_made: List[str], tool_results: Dict[str, Any],
-                                 reasoning_steps: List[str]) -> Dict[str, Any]:
-        """Process AI response and execute tool calls"""
-        
-        message = api_response['choices'][0]['message']
-        
-        # Check for tool calls
-        if hasattr(message, 'tool_calls') and message.get('tool_calls'):
-            reasoning_logger.info(f"AI requested {len(message['tool_calls'])} tool calls")
-            
-            for tool_call in message['tool_calls']:
-                function_name = tool_call['function']['name']
-                arguments = json.loads(tool_call['function']['arguments'])
-                
-                reasoning_logger.info(f"Executing tool: {function_name} with args: {arguments}")
-                tool_calls_made.append(function_name)
-                
-                if function_name in self.available_functions:
-                    try:
-                        # Execute the tool function
-                        func = self.available_functions[function_name]['function']
-                        result = await func(**arguments)
-                        tool_results[function_name] = result
-                        
-                        reasoning_steps.append(f"Executed {function_name}: {result}")
-                        
-                    except Exception as e:
-                        error_msg = f"Tool execution error for {function_name}: {str(e)}"
-                        reasoning_logger.error(error_msg)
-                        tool_results[function_name] = {"error": str(e)}
-                        reasoning_steps.append(error_msg)
-        
-        # Extract decision from AI response
-        ai_reasoning = message.get('content', '')
-        reasoning_steps.append(f"AI Reasoning: {ai_reasoning}")
-        
-        # Parse decision from the AI response or tool results
-        decision_type = self._extract_decision_type(ai_reasoning, tool_results)
-        risk_level = self._extract_risk_level(tool_results)
-        confidence_score = self._extract_confidence_score(tool_results)
-        
-        reasoning_logger.info(f"Final decision: {decision_type} (risk: {risk_level}, confidence: {confidence_score})")
-        
-        return {
-            "decision_type": decision_type,
-            "risk_level": risk_level,
-            "confidence_score": confidence_score,
-            "reasoning": ai_reasoning
-        }
-    
+    _VALID_DECISIONS = {dt.value for dt in DecisionType}
+
     def _extract_decision_type(self, ai_reasoning: str, tool_results: Dict[str, Any]) -> str:
         """Extract decision type from AI reasoning and tool results"""
-        reasoning_lower = ai_reasoning.lower()
-        
-        # Check for explicit decisions in AI response
-        if 'decline' in reasoning_lower or 'block' in reasoning_lower:
-            return DecisionType.DECLINE.value
-        elif 'manual review' in reasoning_lower or 'manual_review' in reasoning_lower:
-            return DecisionType.MANUAL_REVIEW.value
-        elif 'additional auth' in reasoning_lower or 'additional_auth' in reasoning_lower:
-            return DecisionType.ADDITIONAL_AUTH.value
-        elif 'approve' in reasoning_lower:
-            return DecisionType.APPROVE.value
-        
-        # Check tool results for decision hints
+        import re
+
+        # 1. Look for structured decision token: "DECISION: <TYPE>"
+        match = re.search(r'DECISION:\s*(APPROVE|DECLINE|MANUAL_REVIEW|ADDITIONAL_AUTH)', ai_reasoning, re.IGNORECASE)
+        if match:
+            token = match.group(1).upper()
+            if token in self._VALID_DECISIONS:
+                return token
+
+        # 2. Fall back to tool-result-based heuristics
         risk_result = tool_results.get('calculate_risk_score', {})
         compliance_result = tool_results.get('check_compliance_rules', {})
-        
-        # High risk or compliance violations -> decline
+
         if risk_result.get('risk_level') == 'CRITICAL':
             return DecisionType.DECLINE.value
-        
+
         if compliance_result.get('compliance_status') == 'VIOLATION':
             return DecisionType.DECLINE.value
-        
-        # Medium-high risk -> manual review
+
         if risk_result.get('risk_level') == 'HIGH':
             return DecisionType.MANUAL_REVIEW.value
-        
+
         if risk_result.get('risk_level') == 'MEDIUM':
             return DecisionType.ADDITIONAL_AUTH.value
-        
+
         # Default to approve for low risk
         return DecisionType.APPROVE.value
     
@@ -1072,39 +1084,41 @@ Please use your available tools to conduct a thorough analysis and provide a dec
 class TransactionProcessor:
     """Main processor for handling transactions"""
     
-    def __init__(self, config: Dict[str, str]):
-        self.config = config
-        self.running = False
-        
-        # Setup Kafka consumer
-        consumer_config = {
+    @staticmethod
+    def _build_kafka_base_config(config: Dict[str, str]) -> Dict[str, Any]:
+        """Build shared Kafka config keys used by both consumer and producer."""
+        return {
             'bootstrap.servers': config['bootstrap.servers'],
             'security.protocol': config.get('security.protocol', 'SASL_SSL'),
             'sasl.mechanism': config.get('sasl.mechanism', 'PLAIN'),
             'sasl.username': config.get('sasl.username'),
             'sasl.password': config.get('sasl.password'),
             'ssl.endpoint.identification.algorithm': config.get('ssl.endpoint.identification.algorithm', 'https'),
+            'request.timeout.ms': config.get('request.timeout.ms', 40000),
+            'retry.backoff.ms': config.get('retry.backoff.ms', 1000),
+        }
+
+    def __init__(self, config: Dict[str, str]):
+        self.config = config
+        self.running = False
+
+        base_config = self._build_kafka_base_config(config)
+
+        # Setup Kafka consumer
+        consumer_config = {
+            **base_config,
             'group.id': config.get('group.id', 'ai-processor-group'),
             'auto.offset.reset': 'latest',
             'enable.auto.commit': False,
             'session.timeout.ms': config.get('session.timeout.ms', 30000),
-            'request.timeout.ms': config.get('request.timeout.ms', 40000),
-            'retry.backoff.ms': config.get('retry.backoff.ms', 1000)
         }
-        
+
         # Setup Kafka producer for decisions
         producer_config = {
-            'bootstrap.servers': config['bootstrap.servers'],
-            'security.protocol': config.get('security.protocol', 'SASL_SSL'),
-            'sasl.mechanism': config.get('sasl.mechanism', 'PLAIN'),
-            'sasl.username': config.get('sasl.username'),
-            'sasl.password': config.get('sasl.password'),
-            'ssl.endpoint.identification.algorithm': config.get('ssl.endpoint.identification.algorithm', 'https'),
+            **base_config,
             'client.id': 'ai-decision-producer',
-            'request.timeout.ms': config.get('request.timeout.ms', 40000),
-            'retry.backoff.ms': config.get('retry.backoff.ms', 1000)
         }
-        
+
         self.consumer = Consumer(consumer_config)
         self.producer = Producer(producer_config)
         
