@@ -1,0 +1,29 @@
+# Confluent Cloud connection configuration
+# Copy this file to confluent.properties and update with your actual values
+
+bootstrap.servers=pkc-xxxxx.us-west-2.aws.confluent.cloud:9092
+security.protocol=SASL_SSL
+sasl.mechanisms=PLAIN
+sasl.username=YOUR_CONFLUENT_API_KEY
+sasl.password=YOUR_CONFLUENT_API_SECRET
+
+# Topic configuration
+topic=financial-transactions
+
+# Client configuration
+client.id=financial-transaction-producer
+
+# Producer-specific configuration
+acks=all
+retries=2147483647
+max.in.flight.requests.per.connection=5
+enable.idempotence=true
+compression.type=snappy
+batch.size=32768
+linger.ms=10
+buffer.memory=67108864
+
+# Schema Registry (if using)
+# schema.registry.url=https://psrc-xxxxx.us-west-2.aws.confluent.cloud
+# basic.auth.credentials.source=USER_INFO
+# schema.registry.basic.auth.user.info=SR_API_KEY:SR_API_SECRET

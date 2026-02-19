@@ -1,0 +1,22 @@
+# Environment and secrets
+.env
+.env.local
+.env.production
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data stores
+chroma_db/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# IDE / Editor
+.claude/

@@ -1,0 +1,17 @@
+# Core dependencies
+together>=1.0.0
+confluent-kafka>=2.3.0
+streamlit>=1.28.0
+plotly>=5.17.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+dataclasses-json>=0.6.0
+chromadb>=0.4.20
+aiohttp>=3.9.0
+
+# Development dependencies (install with: pip install -r requirements.txt -r requirements-dev.txt)
+# Or use: uv pip install -e ".[dev]"
+
+# Production dependencies (install with: pip install -r requirements.txt -r requirements-prod.txt)
+# Or use: uv pip install -e ".[production]"
