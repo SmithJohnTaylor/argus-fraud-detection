@@ -15,6 +15,9 @@ chroma_db/
 # Logs
 *.log
 
+# Binaries
+bin/confluent
+
 # OS files
 .DS_Store
 
