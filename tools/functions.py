@@ -4,18 +4,52 @@ Financial Transaction Analysis Tools
 Implements core business logic for fraud detection and compliance checking
 """
 
+import hashlib
 import json
 import logging
+import math
 import random
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
-import hashlib
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Module-level constants
+REGULATION_VERSION = "2024.1"
+
+
+def _poisson_sample(lam: float, rng: random.Random) -> int:
+    """Generate a Poisson-distributed random sample using Knuth's algorithm."""
+    if lam <= 0:
+        return 0
+    L = math.exp(-lam)
+    k = 0
+    p = 1.0
+    while True:
+        k += 1
+        p *= rng.random()
+        if p < L:
+            return k - 1
+
+
+def _parse_location(location) -> tuple:
+    """
+    Parse a location field (dict or string) into (location_str, country).
+    Returns (location_str, country_upper).
+    """
+    if isinstance(location, dict):
+        city = location.get('city', 'Unknown')
+        country = location.get('country', 'Unknown')
+        return f"{city}, {country}", country.upper()
+    else:
+        location_str = str(location)
+        country = location_str.split(',')[-1].strip().upper()
+        return location_str, country
 
 
 class RiskLevel(Enum):
@@ -239,92 +273,91 @@ class TransactionHistoryTool:
         """Get or create a realistic customer profile"""
         if customer_id not in self.customer_profiles:
             # Generate deterministic but varied profile based on customer_id
-            seed = int(hashlib.md5(customer_id.encode()).hexdigest()[:8], 16)
-            random.seed(seed)
-            
+            seed = int(hashlib.md5(customer_id.encode(), usedforsecurity=False).hexdigest()[:8], 16)
+            rng = random.Random(seed)
+
             # Account age distribution
             account_age_weights = [0.1, 0.2, 0.3, 0.25, 0.15]  # 0-30, 31-90, 91-365, 366-1095, 1096+ days
             age_ranges = [(1, 30), (31, 90), (91, 365), (366, 1095), (1096, 3650)]
-            age_range = random.choices(age_ranges, weights=account_age_weights)[0]
-            account_age = random.randint(age_range[0], age_range[1])
-            
+            age_range = rng.choices(age_ranges, weights=account_age_weights)[0]
+            account_age = rng.randint(age_range[0], age_range[1])
+
             # Verification status based on account age
             verification_rate = min(0.5 + (account_age / 365) * 0.4, 0.95)
-            
+
             # Risk tier distribution
             risk_tiers = ['LOW', 'MEDIUM', 'HIGH']
             risk_weights = [0.7, 0.25, 0.05]
-            risk_tier = random.choices(risk_tiers, weights=risk_weights)[0]
-            
+            risk_tier = rng.choices(risk_tiers, weights=risk_weights)[0]
+
             profile = CustomerProfile(
                 customer_id=customer_id,
                 account_age_days=account_age,
-                verification_status="VERIFIED" if random.random() < verification_rate else "PARTIAL",
-                account_type=random.choices(['CHECKING', 'SAVINGS', 'PREMIUM'], weights=[0.6, 0.3, 0.1])[0],
-                credit_score=random.randint(550, 850) if random.random() < 0.8 else None,
-                employment_verified=random.random() < verification_rate,
-                phone_verified=random.random() < (verification_rate + 0.1),
-                email_verified=random.random() < (verification_rate + 0.15),
-                identity_verified=random.random() < verification_rate,
+                verification_status="VERIFIED" if rng.random() < verification_rate else "PARTIAL",
+                account_type=rng.choices(['CHECKING', 'SAVINGS', 'PREMIUM'], weights=[0.6, 0.3, 0.1])[0],
+                credit_score=rng.randint(550, 850) if rng.random() < 0.8 else None,
+                employment_verified=rng.random() < verification_rate,
+                phone_verified=rng.random() < (verification_rate + 0.1),
+                email_verified=rng.random() < (verification_rate + 0.15),
+                identity_verified=rng.random() < verification_rate,
                 risk_tier=risk_tier,
-                monthly_income=random.uniform(3000, 15000) if random.random() < 0.7 else None,
-                debt_to_income_ratio=random.uniform(0.1, 0.6) if random.random() < 0.6 else None
+                monthly_income=rng.uniform(3000, 15000) if rng.random() < 0.7 else None,
+                debt_to_income_ratio=rng.uniform(0.1, 0.6) if rng.random() < 0.6 else None
             )
-            
+
             self.customer_profiles[customer_id] = profile
-            
-            # Reset random seed
-            random.seed()
-        
+
         return self.customer_profiles[customer_id]
     
     def _get_transaction_history(self, customer_id: str, days: int) -> List[Dict[str, Any]]:
         """Generate realistic transaction history"""
         if customer_id not in self.transaction_cache:
             profile = self.customer_profiles[customer_id]
-            
+
             # Generate deterministic transactions
-            seed = int(hashlib.md5(f"{customer_id}_txns".encode()).hexdigest()[:8], 16)
-            random.seed(seed)
-            
+            seed = int(hashlib.md5(f"{customer_id}_txns".encode(), usedforsecurity=False).hexdigest()[:8], 16)
+            rng = random.Random(seed)
+
             transactions = []
-            
+
             # Base transaction frequency based on account type and age
             base_frequency = {
                 'CHECKING': 2.5,
                 'SAVINGS': 0.8,
                 'PREMIUM': 4.2
             }.get(profile.account_type, 2.0)
-            
+
             # Adjust frequency based on account age (newer accounts less active)
             age_factor = min(profile.account_age_days / 180, 1.0)
             daily_frequency = base_frequency * age_factor
-            
+
             # Generate transactions for the period
             start_date = datetime.now() - timedelta(days=days)
-            
+
             for day in range(days):
                 current_date = start_date + timedelta(days=day)
-                
+
                 # Weekend effect (less activity)
                 weekend_factor = 0.6 if current_date.weekday() >= 5 else 1.0
-                
-                # Number of transactions for this day
+
+                # Number of transactions for this day (Poisson-distributed)
                 day_frequency = daily_frequency * weekend_factor
-                num_transactions = random.poisson(day_frequency)
-                
+                num_transactions = _poisson_sample(day_frequency, rng)
+
                 for _ in range(num_transactions):
-                    transaction = self._generate_single_transaction(current_date, profile)
+                    transaction = self._generate_single_transaction(current_date, profile, rng)
                     transactions.append(transaction)
-            
+
             self.transaction_cache[customer_id] = transactions
-            random.seed()  # Reset seed
-        
+
         return self.transaction_cache[customer_id]
     
-    def _generate_single_transaction(self, date: datetime, profile: CustomerProfile) -> Dict[str, Any]:
+    def _generate_single_transaction(self, date: datetime, profile: CustomerProfile,
+                                     rng: random.Random = None) -> Dict[str, Any]:
         """Generate a single realistic transaction"""
-        
+        if rng is None:
+            rng = random
+
         # Select merchant category based on profile and randomness
         category_weights = {
             'grocery': 0.25,
@@ -338,11 +371,11 @@ class TransactionHistoryTool:
             'utilities': 0.05,
             'high_risk': 0.01 if profile.risk_tier == 'LOW' else 0.03
         }
-        
-        category = random.choices(list(category_weights.keys()), 
-                                weights=list(category_weights.values()))[0]
-        merchant = random.choice(self.merchant_categories[category])
-        
+
+        category = rng.choices(list(category_weights.keys()),
+                               weights=list(category_weights.values()))[0]
+        merchant = rng.choice(self.merchant_categories[category])
+
         # Amount based on category and customer profile
         amount_ranges = {
             'grocery': (15, 200),
@@ -356,51 +389,51 @@ class TransactionHistoryTool:
             'utilities': (50, 300),
             'high_risk': (100, 10000)
         }
-        
+
         min_amt, max_amt = amount_ranges[category]
-        
+
         # Adjust for customer income if available
         if profile.monthly_income:
             income_factor = profile.monthly_income / 6000  # Normalize around $6k
             max_amt *= income_factor
-        
-        amount = round(random.uniform(min_amt, max_amt), 2)
-        
+
+        amount = round(rng.uniform(min_amt, max_amt), 2)
+
         # Transaction time (business hours more likely)
-        if random.random() < 0.8:  # Normal hours
-            hour = random.choices(range(24), weights=[
+        if rng.random() < 0.8:  # Normal hours
+            hour = rng.choices(range(24), weights=[
                 1, 1, 1, 1, 1, 2, 4, 6, 8, 10, 10, 10,  # 0-11
                 10, 10, 8, 8, 8, 10, 12, 10, 8, 6, 4, 2   # 12-23
             ])[0]
         else:  # Unusual hours
-            hour = random.choice([0, 1, 2, 3, 4, 5, 23])
-        
+            hour = rng.choice([0, 1, 2, 3, 4, 5, 23])
+
         timestamp = date.replace(
             hour=hour,
-            minute=random.randint(0, 59),
-            second=random.randint(0, 59)
+            minute=rng.randint(0, 59),
+            second=rng.randint(0, 59)
         )
-        
+
         # Location based on risk profile
-        if category == 'high_risk' or random.random() < 0.05:
-            location_type = random.choice(['international_risky', 'domestic_medium'])
-        elif random.random() < 0.15:
+        if category == 'high_risk' or rng.random() < 0.05:
+            location_type = rng.choice(['international_risky', 'domestic_medium'])
+        elif rng.random() < 0.15:
             location_type = 'international_safe'
         else:
             location_type = 'domestic_common'
-        
-        location = random.choice(self.locations[location_type])
-        
+
+        location = rng.choice(self.locations[location_type])
+
         # Payment method
         payment_methods = ['CREDIT_CARD', 'DEBIT_CARD', 'BANK_TRANSFER', 'DIGITAL_WALLET']
         if category == 'high_risk':
             payment_methods.extend(['WIRE_TRANSFER', 'CASH', 'CRYPTOCURRENCY'])
-        
-        payment_method = random.choice(payment_methods)
-        
+
+        payment_method = rng.choice(payment_methods)
+
         # Transaction status (most approved)
         status_weights = [0.92, 0.05, 0.03]  # APPROVED, DECLINED, PENDING
-        status = random.choices(['APPROVED', 'DECLINED', 'PENDING'], weights=status_weights)[0]
+        status = rng.choices(['APPROVED', 'DECLINED', 'PENDING'], weights=status_weights)[0]
         
         return {
             'transaction_id': f"TXN_{uuid.uuid4().hex[:8].upper()}",
@@ -424,53 +457,57 @@ class TransactionHistoryTool:
         if not transactions:
             return self._empty_analysis(days)
         
-        # Basic statistics
-        amounts = [tx['amount'] for tx in transactions if tx['status'] == 'APPROVED']
+        # Single-pass accumulation over transactions
         total_transactions = len(transactions)
-        approved_transactions = len(amounts)
-        declined_transactions = len([tx for tx in transactions if tx['status'] == 'DECLINED'])
-        
-        total_amount = sum(amounts) if amounts else 0
-        average_amount = total_amount / len(amounts) if amounts else 0
-        median_amount = sorted(amounts)[len(amounts)//2] if amounts else 0
-        max_amount = max(amounts) if amounts else 0
-        min_amount = min(amounts) if amounts else 0
-        
-        # Frequency analysis
+        approved_amounts = []
+        declined_transactions = 0
+        declined_amount = 0.0
+        weekend_transactions = 0
+        international_transactions = 0
+        merchant_counts = Counter()
+        location_counts = Counter()
+        hour_counts = Counter()
+        category_spending = {}
+
+        for tx in transactions:
+            status = tx['status']
+            amount = tx['amount']
+
+            if status == 'APPROVED':
+                approved_amounts.append(amount)
+                category = tx['merchant_category']
+                category_spending[category] = category_spending.get(category, 0) + amount
+            elif status == 'DECLINED':
+                declined_transactions += 1
+                declined_amount += amount
+
+            merchant_counts[tx['merchant']] += 1
+            location_counts[tx['location']] += 1
+            hour_counts[tx['hour']] += 1
+
+            if tx['is_weekend']:
+                weekend_transactions += 1
+            if tx['is_international']:
+                international_transactions += 1
+
+        # Derived statistics
+        total_amount = sum(approved_amounts) if approved_amounts else 0
+        average_amount = total_amount / len(approved_amounts) if approved_amounts else 0
+        sorted_amounts = sorted(approved_amounts)
+        median_amount = sorted_amounts[len(sorted_amounts) // 2] if sorted_amounts else 0
+        max_amount = sorted_amounts[-1] if sorted_amounts else 0
+        min_amount = sorted_amounts[0] if sorted_amounts else 0
+
         frequency_per_day = total_transactions / days if days > 0 else 0
-        
-        # Merchant and location analysis
-        merchants = [tx['merchant'] for tx in transactions]
-        locations = [tx['location'] for tx in transactions]
-        unique_merchants = len(set(merchants))
-        unique_locations = len(set(locations))
-        
-        # Get most common merchants and locations
-        from collections import Counter
-        merchant_counts = Counter(merchants)
-        location_counts = Counter(locations)
+
+        unique_merchants = len(merchant_counts)
+        unique_locations = len(location_counts)
         common_merchants = [item[0] for item in merchant_counts.most_common(5)]
         common_locations = [item[0] for item in location_counts.most_common(3)]
-        
-        # Time analysis
-        hours = [tx['hour'] for tx in transactions]
-        common_hours = [item[0] for item in Counter(hours).most_common(3)]
-        
-        weekend_transactions = len([tx for tx in transactions if tx['is_weekend']])
+        common_hours = [item[0] for item in hour_counts.most_common(3)]
+
         weekend_ratio = weekend_transactions / total_transactions if total_transactions > 0 else 0
-        
-        international_transactions = len([tx for tx in transactions if tx['is_international']])
         international_ratio = international_transactions / total_transactions if total_transactions > 0 else 0
-        
-        # Declined transaction analysis
-        declined_amount = sum([tx['amount'] for tx in transactions if tx['status'] == 'DECLINED'])
-        
-        # Spending categories
-        category_spending = {}
-        for tx in transactions:
-            if tx['status'] == 'APPROVED':
-                category = tx['merchant_category']
-                category_spending[category] = category_spending.get(category, 0) + tx['amount']
         
         # Velocity analysis
         velocity_patterns = self._analyze_velocity_patterns(transactions)
@@ -806,7 +843,7 @@ class RiskCalculatorTool:
     def _calculate_merchant_risk(self, transaction: Dict[str, Any]) -> Dict[str, Any]:
         """Calculate risk based on merchant category and details"""
         
-        merchant_id = transaction.get('merchant_id', '').upper()
+        merchant_id = transaction.get('merchant', '').upper()
         merchant_category = transaction.get('merchant_category', 'unknown')
         
         # Base risk from category
@@ -849,14 +886,11 @@ class RiskCalculatorTool:
         """Calculate risk based on transaction location"""
         
         location = transaction.get('location', {})
-        if isinstance(location, str):
-            location_str = location
-            country = 'Unknown'
-            city = 'Unknown'
-        else:
-            location_str = f"{location.get('city', 'Unknown')}, {location.get('country', 'Unknown')}"
-            country = location.get('country', 'Unknown').upper()
+        location_str, country = _parse_location(location)
+        if isinstance(location, dict):
             city = location.get('city', 'Unknown')
+        else:
+            city = 'Unknown'
         
         # Determine location risk category
         base_risk = 0.5  # Default for unknown
@@ -902,23 +936,13 @@ class RiskCalculatorTool:
                 history_risk += 0.2
                 context.append("Unusual international activity for domestic customer")
         
-        # Geographic impossibility check (simplified)
-        geo_risk = 0.0
-        if customer_history and customer_history.get('status') == 'success':
-            # This would normally check if transaction location is impossible given recent history
-            # For demo, we'll add risk for certain country combinations
-            if country in ['NIGERIA', 'ROMANIA'] and location_category != 'international_risky':
-                geo_risk = 0.3
-                context.append("Potentially impossible geographic pattern")
-        
-        total_risk = min(base_risk + history_risk + geo_risk, 1.0)
+        total_risk = min(base_risk + history_risk, 1.0)
         
         return {
             'score': round(total_risk, 3),
             'components': {
                 'base_location_risk': round(base_risk, 3),
-                'location_history_risk': round(history_risk, 3),
-                'geographic_impossibility_risk': round(geo_risk, 3)
+                'location_history_risk': round(history_risk, 3)
             },
             'context': context,
             'details': f"Location: {location_str} (Category: {location_category})"
@@ -931,7 +955,7 @@ class RiskCalculatorTool:
         
         try:
             timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        except:
+        except (ValueError, TypeError):
             return {
                 'score': 0.3,
                 'components': {'invalid_timestamp_risk': 0.3},
@@ -1253,7 +1277,16 @@ class ComplianceTool:
             'MILITARY', 'GENERAL', 'ADMIRAL', 'ROYAL', 'PRINCE'
         ]
     
-    def check_compliance_rules(self, transaction: Dict[str, Any], 
+    @staticmethod
+    def _determine_check_status(violations: List, warnings: List) -> str:
+        """Determine compliance status from violations and warnings."""
+        if violations:
+            return "VIOLATION"
+        elif warnings:
+            return "WARNING"
+        return "COMPLIANT"
+
+    def check_compliance_rules(self, transaction: Dict[str, Any],
                              customer_history: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Check transaction against compliance and regulatory rules
@@ -1289,13 +1322,7 @@ class ComplianceTool:
             all_warnings.extend(sanctions_result['warnings'])
             all_warnings.extend(pep_result['warnings'])
             
-            # Determine overall compliance status
-            if all_violations:
-                overall_status = "VIOLATION"
-            elif all_warnings:
-                overall_status = "WARNING"
-            else:
-                overall_status = "COMPLIANT"
+            overall_status = self._determine_check_status(all_violations, all_warnings)
             
             # Determine required reports
             required_reports = self._determine_required_reports(transaction, all_violations, all_warnings)
@@ -1334,7 +1361,7 @@ class ComplianceTool:
                 },
                 "compliance_metadata": {
                     "check_time": datetime.now().isoformat(),
-                    "regulation_version": "2024.1",
+                    "regulation_version": REGULATION_VERSION,
                     "jurisdiction": "US"
                 }
             }
@@ -1419,13 +1446,7 @@ class ComplianceTool:
                 'severity': 'HIGH'
             })
         
-        # Determine AML status
-        if violations:
-            status = "VIOLATION"
-        elif warnings:
-            status = "WARNING"
-        else:
-            status = "COMPLIANT"
+        status = self._determine_check_status(violations, warnings)
         
         return {
             'status': status,
@@ -1507,13 +1528,7 @@ class ComplianceTool:
                 'severity': 'MEDIUM'
             })
         
-        # Determine KYC status
-        if violations:
-            status = "VIOLATION"
-        elif warnings:
-            status = "WARNING"
-        else:
-            status = "COMPLIANT"
+        status = self._determine_check_status(violations, warnings)
         
         return {
             'status': status,
@@ -1530,12 +1545,8 @@ class ComplianceTool:
         
         # Check location against sanctioned countries
         location = transaction.get('location', {})
-        if isinstance(location, dict):
-            country = location.get('country', '').upper().replace(' ', '_')
-        else:
-            # Handle string location format
-            country_part = location.split(',')[-1].strip().upper()
-            country = country_part.replace(' ', '_')
+        _, country = _parse_location(location)
+        country = country.replace(' ', '_')
         
         if country in self.high_risk_countries:
             violations.append({
@@ -1546,7 +1557,7 @@ class ComplianceTool:
             })
         
         # Check merchant against sanctioned entity patterns
-        merchant_id = transaction.get('merchant_id', '').upper()
+        merchant_id = transaction.get('merchant', '').upper()
         merchant_name = transaction.get('merchant_name', '').upper()
         
         for pattern in self.sanctioned_patterns:
@@ -1568,8 +1579,8 @@ class ComplianceTool:
                 'severity': 'HIGH'
             })
         
-        # Additional geographical risk checks
-        if country in ['AFGHANISTAN', 'MYANMAR', 'BELARUS']:
+        # Additional geographical risk checks (skip if already flagged as sanctioned)
+        if country in ['AFGHANISTAN', 'MYANMAR', 'BELARUS'] and country not in self.high_risk_countries:
             warnings.append({
                 'rule': 'HIGH_RISK_JURISDICTION',
                 'description': f'Transaction with high-risk jurisdiction: {country}',
@@ -1577,13 +1588,7 @@ class ComplianceTool:
                 'severity': 'HIGH'
             })
         
-        # Determine sanctions status
-        if violations:
-            status = "VIOLATION"
-        elif warnings:
-            status = "WARNING"
-        else:
-            status = "COMPLIANT"
+        status = self._determine_check_status(violations, warnings)
         
         return {
             'status': status,
@@ -1628,11 +1633,7 @@ class ComplianceTool:
         # International wire transfers require PEP checks
         payment_method = transaction.get('payment_method', '').upper()
         location = transaction.get('location', {})
-        
-        if isinstance(location, dict):
-            country = location.get('country', '').upper()
-        else:
-            country = location.split(',')[-1].strip().upper()
+        _, country = _parse_location(location)
         
         if payment_method == 'WIRE_TRANSFER' and country != 'USA' and amount >= 3000:
             warnings.append({
@@ -1642,13 +1643,7 @@ class ComplianceTool:
                 'severity': 'MEDIUM'
             })
         
-        # Determine PEP status
-        if violations:
-            status = "VIOLATION"
-        elif warnings:
-            status = "WARNING"
-        else:
-            status = "COMPLIANT"
+        status = self._determine_check_status(violations, warnings)
         
         return {
             'status': status,
@@ -1932,7 +1927,7 @@ class AlertTool:
         """Generate a descriptive alert title"""
         
         amount = float(transaction.get('amount', 0))
-        merchant = transaction.get('merchant_id', 'Unknown')
+        merchant = transaction.get('merchant', 'Unknown')
         
         title_templates = {
             'FRAUD': f"{severity} Risk Fraud Alert - ${amount:,.2f} transaction at {merchant}",
@@ -1953,7 +1948,7 @@ class AlertTool:
         
         # Transaction summary
         amount = float(transaction.get('amount', 0))
-        merchant = transaction.get('merchant_id', 'Unknown')
+        merchant = transaction.get('merchant', 'Unknown')
         location = transaction.get('location', {})
         payment_method = transaction.get('payment_method', 'Unknown')
         
@@ -2072,13 +2067,8 @@ class AlertTool:
     
     def _determine_geographic_region(self, transaction: Dict[str, Any]) -> str:
         """Determine geographic region for the transaction"""
-        
         location = transaction.get('location', {})
-        
-        if isinstance(location, dict):
-            country = location.get('country', 'Unknown').upper()
-        else:
-            country = location.split(',')[-1].strip().upper()
+        _, country = _parse_location(location)
         
         if country in ['USA', 'US']:
             return 'DOMESTIC'
